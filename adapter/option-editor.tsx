@@ -1,0 +1,486 @@
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import {
+  css,
+  cx,
+  useFocusRing,
+  palette,
+  spacing,
+  rafraf,
+  useDarkMode,
+  DocumentList,
+} from '@mongodb-js/compass-components';
+import type {
+  Command,
+  EditorRef,
+  SavedQuery,
+} from '@mongodb-js/compass-editor';
+import {
+  CodemirrorInlineEditor as InlineEditor,
+  createQueryWithHistoryAutocompleter,
+  useSafeIntegerLinter,
+} from '@mongodb-js/compass-editor';
+import { connect } from '../stores/context';
+import { usePreference } from 'compass-preferences-model/provider';
+import { lenientlyFixQuery } from '../query/leniently-fix-query';
+import type { RootState } from '../stores/query-bar-store';
+import { useAutocompleteFields } from '@mongodb-js/compass-field-store';
+import {
+  applyFilterChange,
+  applyFromHistory,
+} from '../stores/query-bar-reducer';
+import type { ChangeFilterEvent } from '../modules/change-filter';
+import { getQueryAttributes } from '../utils';
+import type {
+  BaseQuery,
+  QueryFormFields,
+  QueryProperty,
+} from '../constants/query-properties';
+import { QUERY_PROPERTIES } from '../constants/query-properties';
+import { mapQueryToFormFields } from '../utils/query';
+import { DEFAULT_FIELD_VALUES } from '../constants/query-bar-store';
+import type {
+  FavoriteQuery,
+  RecentQuery,
+} from '@mongodb-js/my-queries-storage';
+import type { QueryOptionOfTypeDocument } from '../constants/query-option-definition';
+import { useTelemetry } from '@mongodb-js/compass-telemetry/provider';
+
+type AutoCompleteQuery<T extends { _lastExecuted: Date }> = Partial<T> & {
+  _lastExecuted: Date;
+};
+type AutoCompleteRecentQuery = AutoCompleteQuery<RecentQuery>;
+type AutoCompleteFavoriteQuery = AutoCompleteQuery<FavoriteQuery>;
+
+const editorContainerStyles = css({
+  position: 'relative',
+  display: 'flex',
+  width: '100%',
+  minWidth: spacing[7],
+  // To match codemirror editor with leafygreen inputs.
+  paddingTop: 1,
+  paddingBottom: 1,
+  paddingLeft: 4,
+  paddingRight: 0,
+  border: '1px solid transparent',
+  borderRadius: spacing[100],
+  overflow: 'visible',
+});
+
+const editorDropTargetStyles = css({
+  borderColor: palette.green.base,
+  backgroundColor: palette.green.light3,
+});
+
+const editorDropTargetDarkModeStyles = css({
+  borderColor: palette.green.base,
+  backgroundColor: palette.green.dark3,
+});
+
+const editorWithErrorStyles = css({
+  '&:after': {
+    position: 'absolute',
+    top: -1,
+    left: -1,
+    right: -1,
+    bottom: -1,
+    zIndex: 2,
+    borderRadius: spacing[100],
+    border: `1px solid ${palette.red.base}`,
+    pointerEvents: 'none',
+  },
+  '&:focus-within': {
+    borderColor: palette.gray.base,
+  },
+});
+
+// For querybar we want tooltip to be more like LG popover
+const getDiagnosticActionTooltipTheme = (darkMode?: boolean) => ({
+  spec: {
+    '& .cm-tooltip.cm-tooltip-lint': {
+      borderRadius: `${spacing[300]}px`,
+      boxShadow: darkMode
+        ? `0 ${spacing[100]}px ${spacing[300]}px rgba(0, 0, 0, 0.5)`
+        : `0 ${spacing[100]}px ${spacing[300]}px rgba(0, 0, 0, 0.15)`,
+      overflow: 'hidden',
+    },
+    '& .cm-diagnostic': {
+      padding: `${spacing[200]}px ${spacing[300]}px`,
+      marginLeft: 0,
+      borderLeft: 'none',
+      display: 'flex',
+      gap: `${spacing[200]}px`,
+      alignItems: 'center',
+    },
+    '& .cm-diagnosticAction': {
+      padding: `0 ${spacing[150]}px`,
+      fontWeight: 500,
+      lineHeight: '20px',
+      color: darkMode ? palette.gray.light2 : palette.gray.dark2,
+      backgroundColor: darkMode ? palette.gray.dark2 : palette.white,
+      textDecoration: 'none',
+      border: `1px solid ${palette.gray.base}`,
+      borderRadius: `${spacing[150]}px`,
+      cursor: 'pointer',
+      transition: 'all 150ms ease-in-out',
+    },
+    '& .cm-diagnosticAction:hover': {
+      backgroundColor: darkMode ? palette.gray.dark1 : palette.gray.light2,
+      borderColor: darkMode ? palette.gray.base : palette.gray.dark1,
+      boxShadow: darkMode
+        ? `0 0 0 ${spacing[100]}px ${palette.gray.dark2}`
+        : `0 0 0 ${spacing[100]}px ${palette.gray.light2}`,
+    },
+    '& .cm-diagnosticAction:focus-visible': {
+      outline: 'none',
+      boxShadow: `0 0 0 ${spacing[100]}px ${
+        darkMode ? palette.blue.light1 : palette.blue.base
+      }`,
+    },
+  },
+  options: { dark: darkMode },
+});
+
+type OptionEditorProps = {
+  optionName: QueryOptionOfTypeDocument;
+  namespace: string;
+  id?: string;
+  hasError?: boolean;
+  /**
+   * When `true` will insert an empty document in the input on focus and put
+   * cursor in the middle of the inserted string. Default is `true`
+   */
+  insertEmptyDocOnFocus?: boolean;
+  onChange: (value: string) => void;
+  onUnsafeInteger: () => void;
+  onApply?(): void;
+  onBlur?(): void;
+  placeholder?: string | (() => HTMLElement);
+  serverVersion?: string;
+  value?: string;
+  ['data-testid']?: string;
+  disabled?: boolean;
+  recentQueries: AutoCompleteRecentQuery[];
+  favoriteQueries: AutoCompleteFavoriteQuery[];
+  onApplyQuery: (query: BaseQuery, fieldsToPreserve: QueryProperty[]) => void;
+  /**
+   * Applies a change to the filter. Used when a field is dropped onto the
+   * editor; not needed when the editor is rendered for another query option.
+   */
+  onFilterChange?: (event: ChangeFilterEvent) => void;
+};
+
+export const OptionEditor: React.FunctionComponent<OptionEditorProps> = ({
+  optionName,
+  namespace,
+  id,
+  hasError = false,
+  insertEmptyDocOnFocus = true,
+  onChange,
+  onApply,
+  onBlur,
+  placeholder,
+  serverVersion = '3.6.0',
+  value = '',
+  ['data-testid']: dataTestId,
+  disabled = false,
+  recentQueries,
+  favoriteQueries,
+  onApplyQuery,
+  onUnsafeInteger,
+  onFilterChange,
+}) => {
+  const editorContainerRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<EditorRef>(null);
+
+  const focusRingProps = useFocusRing({
+    outer: true,
+    focusWithin: true,
+    hover: true,
+  });
+
+  const darkMode = useDarkMode();
+
+  const onApplyRef = useRef(onApply);
+  onApplyRef.current = onApply;
+
+  const commands = useMemo<Command[]>(() => {
+    return [
+      {
+        key: 'Enter',
+        run() {
+          onApplyRef.current?.();
+          return true;
+        },
+        preventDefault: true,
+      },
+    ];
+  }, []);
+
+  const schemaFields = useAutocompleteFields(namespace);
+  const maxTimeMSPreference = usePreference('maxTimeMS');
+
+  const savedQueries = useMemo(() => {
+    return [
+      ...getOptionBasedQueries(optionName, 'recent', recentQueries),
+      ...getOptionBasedQueries(optionName, 'favorite', favoriteQueries),
+    ];
+  }, [optionName, recentQueries, favoriteQueries]);
+
+  const completer = useMemo(() => {
+    return createQueryWithHistoryAutocompleter({
+      queryProperty: optionName,
+      savedQueries,
+      options: {
+        fields: schemaFields,
+        serverVersion,
+      },
+      onApply: (query: SavedQuery['queryProperties']) => {
+        // When we are applying a query from `filter` field, we want to apply the whole query,
+        // otherwise we want to preserve the other fields that are already in the current query.
+        const fieldsToPreserve =
+          optionName === 'filter'
+            ? []
+            : QUERY_PROPERTIES.filter((x) => x !== optionName);
+        onApplyQuery(query, fieldsToPreserve);
+        if (!query[optionName]) {
+          return;
+        }
+        const formFields = mapQueryToFormFields(
+          { maxTimeMS: maxTimeMSPreference },
+          {
+            ...DEFAULT_FIELD_VALUES,
+            ...query,
+          }
+        );
+        const optionFormField = formFields[optionName as keyof QueryFormFields];
+        if (optionFormField?.string) {
+          // When we did apply something we want to move the cursor to the end of the input.
+          editorRef.current?.cursorDocEnd();
+        }
+      },
+      theme: darkMode ? 'dark' : 'light',
+    });
+  }, [
+    maxTimeMSPreference,
+    savedQueries,
+    schemaFields,
+    serverVersion,
+    onApplyQuery,
+    darkMode,
+    optionName,
+  ]);
+  const track = useTelemetry();
+  const linterAnnotationTheme = useMemo(
+    () => getDiagnosticActionTooltipTheme(darkMode),
+    [darkMode]
+  );
+  const { safeIntegerLinter, violations: safeIntegerViolations } =
+    useSafeIntegerLinter({
+      theme: linterAnnotationTheme,
+      onFixViolation: (source) => `Long("${source}")`,
+      onViolationFixed() {
+        track('Safe Integer Fix Applied', {
+          source: 'query-bar-editor',
+        });
+      },
+    });
+  useEffect(() => {
+    if (safeIntegerViolations.length > 0) {
+      onUnsafeInteger();
+    }
+  }, [safeIntegerViolations, onUnsafeInteger]);
+
+  const onFocus = () => {
+    if (insertEmptyDocOnFocus) {
+      rafraf(() => {
+        if (
+          editorRef.current?.editorContents === '' ||
+          editorRef.current?.editorContents === '{}'
+        ) {
+          editorRef.current?.applySnippet('\\{${}}');
+          if (editorRef.current?.editor) editorRef.current?.startCompletion();
+        }
+      });
+    }
+  };
+
+  const onPaste = (event: React.ClipboardEvent<HTMLDivElement>) => {
+    if (insertEmptyDocOnFocus && editorRef.current) {
+      const { main: currentSelection } =
+        editorRef.current.editor?.state.selection ?? {};
+      const currentContents = editorRef.current.editorContents;
+      // Only try to fix user paste if we are handling editor state similar to
+      // what happens after we auto-inserted empty brackets on initial focus, do
+      // not mess with user input in any other case
+      if (
+        currentContents === '{}' &&
+        currentSelection &&
+        currentSelection.from === 1 &&
+        currentSelection.to === 1
+      ) {
+        const pasteContents = event.clipboardData.getData('text');
+        const snippet = lenientlyFixQuery(`{${pasteContents}}`);
+        if (snippet) {
+          event.preventDefault();
+          editorRef.current.applySnippet(snippet);
+        }
+      }
+    }
+  };
+
+  // Dropping a field dragged from the document list adds it to the filter
+  // rather than pasting its text. Fields accumulate: a filter with two keys is
+  // an implicit $and, and dropping the same field twice collects the values
+  // into an $in. This is the same change the "Add to query" context menu makes.
+  const [isDragOver, setIsDragOver] = useState(false);
+  const acceptsDroppedFields =
+    optionName === 'filter' && !disabled && !!onFilterChange;
+
+  const hasDraggedField = (dataTransfer: DataTransfer) => {
+    // `types` is readable during dragover, where the data itself is not.
+    return Array.from(dataTransfer.types).includes(
+      DocumentList.DOCUMENT_FIELD_DRAG_TYPE
+    );
+  };
+
+  // Capture phase: the editor has its own drop handling that would insert the
+  // text/plain version of the field, so the event has to be claimed before it
+  // reaches it.
+  const onDragOverCapture = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!acceptsDroppedFields || !hasDraggedField(event.dataTransfer)) {
+        return;
+      }
+      // Without preventDefault the browser treats this as "no drop allowed"
+      // and never fires the drop event.
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = 'copy';
+      setIsDragOver(true);
+    },
+    [acceptsDroppedFields]
+  );
+
+  const onDropCapture = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!acceptsDroppedFields) {
+        return;
+      }
+      const dragged = DocumentList.getDraggedDocumentField(event.dataTransfer);
+      if (!dragged) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setIsDragOver(false);
+      onFilterChange?.({
+        type: 'addDistinctValue',
+        payload: { field: dragged.field, value: dragged.value },
+      });
+    },
+    [acceptsDroppedFields, onFilterChange]
+  );
+
+  const onDragLeave = useCallback(() => {
+    setIsDragOver(false);
+  }, []);
+
+  return (
+    <div
+      className={cx(
+        editorContainerStyles,
+        !disabled && focusRingProps.className,
+        hasError && editorWithErrorStyles,
+        isDragOver &&
+          (darkMode ? editorDropTargetDarkModeStyles : editorDropTargetStyles)
+      )}
+      ref={editorContainerRef}
+      onDragOverCapture={onDragOverCapture}
+      onDropCapture={onDropCapture}
+      onDragLeave={onDragLeave}
+      data-drag-over={isDragOver ? 'true' : undefined}
+    >
+      <InlineEditor
+        ref={editorRef}
+        id={id}
+        text={value}
+        showAnnotationsGutter={optionName === 'filter'}
+        onChangeText={onChange}
+        placeholder={placeholder}
+        completer={completer}
+        linter={safeIntegerLinter}
+        commands={commands}
+        data-testid={dataTestId}
+        disabled={disabled}
+        onFocus={onFocus}
+        onPaste={onPaste}
+        onBlur={onBlur}
+      />
+    </div>
+  );
+};
+
+export function getOptionBasedQueries(
+  optionName: QueryOptionOfTypeDocument,
+  type: 'recent' | 'favorite',
+  queries: (AutoCompleteRecentQuery | AutoCompleteFavoriteQuery)[]
+) {
+  return (
+    queries
+      .map((query) => ({
+        type,
+        lastExecuted: query._lastExecuted,
+        // For query that's being autocompeted from the main `filter`, we want to
+        // show whole query to the user, so that when its applied, it will replace
+        // the whole query (filter, project, sort etc).
+        // For other options, we only want to show the query for that specific option.
+        queryProperties: getQueryAttributes(
+          optionName !== 'filter' ? { [optionName]: query[optionName] } : query
+        ),
+      }))
+      // Filter the query if:
+      // - its empty
+      // - its an `update` query
+      // - its a duplicate
+      .filter((query, i, arr) => {
+        const queryIsUpdate = 'update' in query.queryProperties;
+        const queryIsEmpty = Object.keys(query.queryProperties).length === 0;
+        if (queryIsEmpty || queryIsUpdate) {
+          return false;
+        }
+        return (
+          i ===
+          arr.findIndex(
+            (t) =>
+              JSON.stringify(t.queryProperties) ===
+              JSON.stringify(query.queryProperties)
+          )
+        );
+      })
+      .sort((a, b) => a.lastExecuted.getTime() - b.lastExecuted.getTime())
+      // Only take the most recent 5 queries.
+      .slice(-5)
+  );
+}
+
+const mapStateToProps = ({
+  queryBar: { namespace, serverVersion, recentQueries, favoriteQueries },
+}: RootState) => ({
+  namespace,
+  serverVersion,
+  recentQueries,
+  favoriteQueries,
+});
+
+const mapDispatchToProps = {
+  onApplyQuery: applyFromHistory,
+  onFilterChange: applyFilterChange,
+};
+
+export default connect(mapStateToProps, mapDispatchToProps)(OptionEditor);

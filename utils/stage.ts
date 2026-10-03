@@ -1,0 +1,460 @@
+import toNS from 'mongodb-ns';
+import {
+  ADL,
+  ATLAS,
+  ON_PREM,
+  STAGE_OPERATORS,
+  VECTOR_SEARCH_AUTO_EMBED_STAGE,
+  OUT_STAGES,
+  TIME_SERIES,
+  VIEW,
+  COLLECTION,
+  getFilteredCompletions,
+} from '@mongodb-js/mongodb-constants';
+import type { Completion } from '@mongodb-js/mongodb-constants';
+import { parseShellBSON } from '../modules/pipeline-builder/pipeline-parser/utils';
+import { STAGE_HELP_BASE_URL } from '../constants';
+import type { StoreStage } from '../modules/pipeline-builder/stage-editor';
+import type { ServerEnvironment } from '../modules/env';
+import type { Document, MongoServerError } from 'mongodb';
+
+export function isAtlasOnly(operatorEnv: readonly ServerEnvironment[]) {
+  return operatorEnv?.every((env) => env === ATLAS);
+}
+
+function disallowOutputStagesOnCompassReadonly(
+  operator: ReturnType<typeof getFilteredCompletions>[number],
+  preferencesReadOnly: boolean
+): boolean {
+  if (operator?.outputStage) {
+    return !preferencesReadOnly;
+  }
+
+  return true;
+}
+
+function disallowRerankOnNonAtlas(
+  operator: ReturnType<typeof getFilteredCompletions>[number],
+  env: ServerEnvironment
+): boolean {
+  if ((operator as FilteredStageOperators[number])?.name === '$rerank') {
+    return env === ATLAS;
+  }
+
+  return true;
+}
+
+const FilteredStagesCache = new Map();
+
+// XXX: `name` is actually already part of the return type, getFilteredCompletions is just under-typed
+export type FilteredStageOperators = (ReturnType<
+  typeof getFilteredCompletions
+>[number] & { name: string; env: ServerEnvironment[]; description: string })[];
+
+/**
+ * Filters stage operators by server version.
+ */
+export const filterStageOperators = ({
+  serverVersion,
+  env,
+  isTimeSeries,
+  sourceName,
+  preferencesReadOnly,
+}: {
+  serverVersion: string;
+  env: ServerEnvironment;
+  isTimeSeries: boolean;
+  sourceName: string | null;
+  preferencesReadOnly: boolean;
+}): FilteredStageOperators => {
+  const namespaceType = isTimeSeries
+    ? TIME_SERIES
+    : // we identify a view looking for a source namespace (sourceName) in stats
+    sourceName
+    ? VIEW
+    : COLLECTION;
+
+  const cacheKey = JSON.stringify({
+    serverVersion,
+    env,
+    namespaceType,
+    preferencesReadOnly,
+  });
+
+  if (FilteredStagesCache.has(cacheKey)) {
+    return FilteredStagesCache.get(cacheKey);
+  }
+
+  const filteredStages = getFilteredCompletions({
+    serverVersion,
+    meta: ['stage'],
+    stage: {
+      namespace: namespaceType,
+      env:
+        env === ON_PREM
+          ? // we want to display Atlas-only stages
+            // also when connected to on-prem / localhost
+            // in order to improve their discoverability:
+            [env, ATLAS]
+          : env,
+    },
+  })
+    .filter((op) =>
+      disallowOutputStagesOnCompassReadonly(op, preferencesReadOnly)
+    )
+    .filter((op) =>
+      disallowRerankOnNonAtlas(op, env)
+    ) as FilteredStageOperators;
+
+  FilteredStagesCache.set(cacheKey, filteredStages);
+
+  return filteredStages;
+};
+
+export function getStageOperator(
+  stage: Record<string, unknown> | undefined | null
+): string | undefined {
+  return Object.keys(stage ?? {})[0];
+}
+
+/**
+ * Extracts destination collection from $merge and $out operators
+ *
+ * @see {@link https://www.mongodb.com/docs/manual/reference/operator/aggregation/merge/#syntax}
+ * @see {@link https://www.mongodb.com/docs/atlas/data-federation/supported-unsupported/pipeline/merge/#syntax}
+ * @see {@link https://www.mongodb.com/docs/manual/reference/operator/aggregation/out/#syntax}
+ * @see {@link https://www.mongodb.com/docs/atlas/data-federation/supported-unsupported/pipeline/out/#syntax}
+ */
+export function getDestinationNamespaceFromStage(
+  namespace: string,
+  stage: Record<string, unknown> | null
+): string | null {
+  if (!stage) {
+    return null;
+  }
+  const stageOperator = getStageOperator(stage);
+  const stageValue = stageOperator && stage[stageOperator];
+
+  if (!stageValue) {
+    return null;
+  }
+
+  if (stageOperator === '$merge') {
+    return getDestinationNamespaceFromMergeStage(namespace, stageValue);
+  }
+  if (stageOperator === '$out') {
+    return getDestinationNamespaceFromOutStage(namespace, stageValue);
+  }
+  return null;
+}
+
+function getDestinationNamespaceFromMergeStage(
+  namespace: string,
+  stageValue: any
+) {
+  const { database } = toNS(namespace);
+
+  const ns = typeof stageValue === 'string' ? stageValue : stageValue.into;
+
+  if (!ns) {
+    return null;
+  }
+
+  if (typeof ns === 'string') {
+    return `${database}.${ns}`;
+  }
+
+  if (ns.atlas) {
+    // TODO: Not handled currently and we need some time to figure out how to
+    // handle it so just skipping for now
+    return null;
+  }
+
+  if (ns.db && ns.coll) {
+    return `${ns.db}.${ns.coll}`;
+  }
+  return null;
+}
+
+function getDestinationNamespaceFromOutStage(
+  namespace: string,
+  stageValue: any
+) {
+  const { database } = toNS(namespace);
+
+  if (typeof stageValue === 'string') {
+    return `${database}.${stageValue}`;
+  }
+
+  if (stageValue.s3 || stageValue.atlas) {
+    // TODO: Not handled currently and we need some time to figure out how to
+    // handle it so just skipping for now
+    return null;
+  }
+
+  if (stageValue.db && stageValue.coll) {
+    return `${stageValue.db}.${stageValue.coll}`;
+  }
+  return null;
+}
+
+const OUT_OPERATOR_NAMES: ReadonlySet<string> = new Set(
+  OUT_STAGES.map((stage) => stage.value)
+);
+
+const ATLAS_ONLY_OPERATOR_NAMES: ReadonlySet<string> = new Set(
+  STAGE_OPERATORS.filter((stage) => isAtlasOnly(stage.env)).map(
+    (stage) => stage.value
+  )
+);
+
+export function isOutputStage(
+  stageOperator: string | null | undefined
+): boolean {
+  return !!stageOperator && OUT_OPERATOR_NAMES.has(stageOperator);
+}
+
+export function isAtlasOnlyStage(
+  stageOperator: string | null | undefined
+): boolean {
+  return !!stageOperator && ATLAS_ONLY_OPERATOR_NAMES.has(stageOperator);
+}
+
+export type SearchStageOperator = '$search' | '$searchMeta' | '$vectorSearch';
+
+/*
+Atlas Search does not return an error if there is no search index - it just
+returns no results. So if the connection has access to Atlas Search and the
+aggregation used a search-related stage and got no results we want to display a
+different error.
+*/
+export function isSearchStage(
+  stageOperator: string | null | undefined
+): stageOperator is SearchStageOperator {
+  if (!stageOperator) {
+    return false;
+  }
+  return ['$search', '$searchMeta', '$vectorSearch'].includes(stageOperator);
+}
+
+export function mapSearchStageOperatorToSearchIndexType(
+  searchStageOperator: SearchStageOperator
+): 'search' | 'vectorSearch' {
+  return searchStageOperator === '$vectorSearch' ? 'vectorSearch' : 'search';
+}
+
+/**
+ * Extracts the search index name from a $search, $searchMeta, or $vectorSearch stage.
+ * Returns null if the stage value cannot be parsed or doesn't contain an index field.
+ */
+export function getSearchIndexNameFromSearchStage(
+  stageOperator: string | null,
+  stageValue: string | null
+): string | null {
+  if (!stageOperator || !stageValue || !isSearchStage(stageOperator)) {
+    return null;
+  }
+
+  try {
+    const stage = parseShellBSON<Document>(`{${stageOperator}: ${stageValue}}`);
+    const indexName = stage[stageOperator]?.index;
+    return typeof indexName === 'string' ? indexName : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Finds the search stage ($search, $searchMeta, or $vectorSearch) in a pipeline
+ * and extracts both the stage operator and index name from it.
+ * Search stages must be the first stage in a pipeline.
+ */
+export function getSearchStageInfoFromPipeline(pipelineText: string): {
+  searchIndexName: string | null;
+  searchStageOperator: SearchStageOperator | null;
+} {
+  const invalid = { searchIndexName: null, searchStageOperator: null };
+  try {
+    const pipeline = parseShellBSON<Document[]>(pipelineText);
+    if (!Array.isArray(pipeline) || pipeline.length === 0) {
+      return invalid;
+    }
+
+    const firstStage = pipeline[0];
+    const stageOperator = getStageOperator(firstStage);
+
+    if (!isSearchStage(stageOperator)) {
+      return invalid;
+    }
+
+    const indexName = firstStage[stageOperator]?.index;
+    return {
+      searchIndexName: typeof indexName === 'string' ? indexName : null,
+      searchStageOperator: stageOperator,
+    };
+  } catch {
+    return invalid;
+  }
+}
+
+type StageOperatorEntry = (typeof STAGE_OPERATORS)[number];
+
+/**
+ * Stage operator list with optional replacement of `$vectorSearch` metadata
+ * when Automated Embedding public preview is enabled.
+ */
+export function stageOperatorsWithAutoEmbedPreview(
+  enableAutoEmbeddingPublicPreview: boolean
+): readonly StageOperatorEntry[] {
+  return STAGE_OPERATORS.map((op) =>
+    op.name === '$vectorSearch' && enableAutoEmbeddingPublicPreview
+      ? (VECTOR_SEARCH_AUTO_EMBED_STAGE as unknown as StageOperatorEntry)
+      : op
+  );
+}
+
+/**
+ * Applies preference-driven stage metadata overrides to a filtered operator
+ * list (e.g. the stage combobox). When Automated Embedding public preview is
+ * enabled, the `$vectorSearch` entry is replaced with
+ * `VECTOR_SEARCH_AUTO_EMBED_STAGE`.
+ */
+export function applyFeatureFlagChangesToFilteredOperators(
+  operators: FilteredStageOperators,
+  enableAutoEmbeddingPublicPreview: boolean
+): FilteredStageOperators {
+  if (!enableAutoEmbeddingPublicPreview) {
+    return operators;
+  }
+
+  return operators.map((op) =>
+    op.name === '$vectorSearch'
+      ? {
+          ...VECTOR_SEARCH_AUTO_EMBED_STAGE,
+          env: VECTOR_SEARCH_AUTO_EMBED_STAGE.env as ServerEnvironment[],
+          meta: VECTOR_SEARCH_AUTO_EMBED_STAGE.meta as Completion['meta'],
+        }
+      : op
+  );
+}
+
+const stageOperatorsMapByPreviewFlag = new Map<
+  boolean,
+  Map<string, StageOperatorEntry>
+>();
+
+export function getStageOperatorsMap(
+  enableAutoEmbeddingPublicPreview: boolean
+): Map<string, StageOperatorEntry> {
+  let cached = stageOperatorsMapByPreviewFlag.get(
+    enableAutoEmbeddingPublicPreview
+  );
+  if (!cached) {
+    cached = new Map(
+      stageOperatorsWithAutoEmbedPreview(enableAutoEmbeddingPublicPreview).map(
+        (stage) => [stage.value, stage]
+      )
+    );
+    stageOperatorsMapByPreviewFlag.set(
+      enableAutoEmbeddingPublicPreview,
+      cached
+    );
+  }
+  return cached;
+}
+
+export const getStageHelpLink = (
+  stageOperator: string | null | undefined
+): string | null => {
+  if (!stageOperator) {
+    return null;
+  }
+  return `${STAGE_HELP_BASE_URL}/${stageOperator.replace(/^\$/, '')}/`;
+};
+
+export function getStageInfo(
+  namespace: string,
+  stageOperator: string | null,
+  stageValue: string | undefined | null,
+  enableAutoEmbeddingPublicPreview = false
+): { description?: string; link: string | null; destination: string | null } {
+  const stage = stageOperator
+    ? getStageOperatorsMap(enableAutoEmbeddingPublicPreview).get(stageOperator)
+    : undefined;
+  return {
+    description: stage?.description,
+    link: getStageHelpLink(stageOperator),
+    destination:
+      stageOperator && isOutputStage(stageOperator)
+        ? (() => {
+            try {
+              const stage = parseShellBSON<Document>(
+                `{${stageOperator}: ${stageValue}}`
+              );
+              if (stage[stageOperator].s3) {
+                return 'S3 bucket';
+              }
+              if (
+                stage[stageOperator].atlas ||
+                stage[stageOperator].into?.atlas
+              ) {
+                return 'Atlas cluster';
+              }
+              return getDestinationNamespaceFromStage(namespace, stage);
+            } catch {
+              return null;
+            }
+          })()
+        : null,
+  };
+}
+
+/**
+ * @param {import('mongodb').Document[]} pipeline
+ * @returns {string}
+ */
+export const getLastStageOperator = (pipeline: Record<string, unknown>[]) => {
+  const lastStage = pipeline[pipeline.length - 1];
+  return getStageOperator(lastStage) ?? '';
+};
+
+/**
+ * @param {import('mongodb').Document[]} pipeline
+ * @returns {boolean}
+ */
+export const isLastStageOutputStage = (pipeline: Record<string, unknown>[]) => {
+  return isOutputStage(getLastStageOperator(pipeline));
+};
+
+export const isMissingAtlasStageSupport = (
+  env: ServerEnvironment,
+  operator: string | null | undefined,
+  serverError: MongoServerError | null | undefined
+) => {
+  return (
+    ![ADL, ATLAS].includes(env) &&
+    isAtlasOnlyStage(operator) &&
+    [
+      // Unrecognized pipeline stage name
+      40324,
+      // The full-text search stage is not enabled
+      31082,
+      // "Search stages are only allowed on MongoDB Atlas"
+      6047400, 6047401,
+      // "Query Feature Not Allowed"
+      224,
+    ].includes(Number(serverError?.code ?? -1))
+  );
+};
+
+/**
+ * Returns the atlas operator
+ * @param {string[]} operators
+ */
+export const findAtlasOperator = (operators: string[]) => {
+  return operators.find((operator) => isAtlasOnlyStage(operator));
+};
+
+export function hasSyntaxError(stage: StoreStage) {
+  return !!stage.syntaxError && !!stage.stageOperator && !!stage.value;
+}

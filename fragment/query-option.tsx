@@ -1,0 +1,299 @@
+import React, { useCallback, useRef, useMemo } from 'react';
+import {
+  Label,
+  TextInput,
+  Tooltip,
+  css,
+  cx,
+  spacing,
+  palette,
+  useDarkMode,
+  useCurrentValueRef,
+} from '@mongodb-js/compass-components';
+import { connect } from '../stores/context';
+import OptionEditor from './option-editor';
+import { OPTION_DEFINITION } from '../constants/query-option-definition';
+import type {
+  QueryOptionOfTypeDocument,
+  QueryOption as QueryOptionType,
+} from '../constants/query-option-definition';
+import {
+  changeField,
+  unsafeIntegerReceived,
+} from '../stores/query-bar-reducer';
+import type { QueryProperty } from '../constants/query-properties';
+import type { RootState } from '../stores/query-bar-store';
+import { useTelemetry } from '@mongodb-js/compass-telemetry/provider';
+import { useConnectionInfoRef } from '@mongodb-js/compass-connections/provider';
+import { usePreference } from 'compass-preferences-model/provider';
+
+const queryOptionStyles = css({
+  display: 'flex',
+  position: 'relative',
+  alignItems: 'flex-start',
+});
+
+const documentEditorOptionContainerStyles = css({
+  flexGrow: 1,
+});
+
+const queryOptionLabelStyles = css({
+  marginRight: spacing[200],
+});
+
+const documentEditorQueryOptionLabelStyles = css(queryOptionLabelStyles, {
+  minWidth: spacing[800] * 2,
+});
+
+const documentEditorOptionStyles = css({
+  minWidth: spacing[7],
+  display: 'flex',
+  flexGrow: 1,
+});
+
+const numericTextInputLightStyles = css({
+  input: {
+    borderColor: 'transparent',
+  },
+});
+
+const numericTextInputDarkStyles = css({
+  input: {
+    borderColor: 'transparent',
+  },
+});
+
+const optionInputWithErrorStyles = css({
+  input: {
+    borderColor: palette.red.base,
+  },
+});
+
+const queryOptionLabelContainerStyles = css({
+  // Hardcoded height as we want the label not to vertically
+  // center on the input area when it's expanded.
+  height: spacing[600] + spacing[100],
+  textTransform: 'capitalize',
+  display: 'flex',
+  alignItems: 'center',
+});
+
+export const documentEditorLabelContainerStyles = css(
+  queryOptionLabelContainerStyles,
+  {
+    minWidth: spacing[800] * 2,
+  }
+);
+
+type QueryBarProperty = Exclude<QueryProperty, 'update'>;
+
+type QueryOptionProps = {
+  id: string;
+  name: QueryBarProperty;
+  value?: string;
+  hasError: boolean;
+  onChange: (name: QueryBarProperty, value: string) => void;
+  placeholder?: string | (() => HTMLElement);
+  onApply?(): void;
+  onUnsafeIntegerReceived(name: QueryBarProperty): void;
+  disabled?: boolean;
+};
+
+// Helper component to allow flexible computation of extra props for the TextInput
+// component if the query option definition suggests it. In particular,
+// using a separate component allows those extra props to use React hooks in their definition.
+const WithOptionDefinitionTextInputProps: React.FunctionComponent<{
+  definition: (typeof OPTION_DEFINITION)[QueryOptionType];
+  children: ({
+    props,
+  }: {
+    props: Partial<React.ComponentProps<typeof TextInput>>;
+  }) => JSX.Element;
+}> = ({ definition, children }) => {
+  let props: Partial<React.ComponentProps<typeof TextInput>> = {};
+  if (definition.type === 'numeric') {
+    props.inputMode = 'numeric';
+    props.pattern = '[0-9]*';
+  }
+  props = { ...props, ...definition.extraTextInputProps?.() };
+  return children({ props });
+};
+
+const QueryOption: React.FunctionComponent<QueryOptionProps> = ({
+  hasError,
+  onChange,
+  id,
+  placeholder,
+  name,
+  value,
+  onApply,
+  disabled = false,
+  onUnsafeIntegerReceived,
+}) => {
+  const track = useTelemetry();
+  const connectionInfoRef = useConnectionInfoRef();
+  const darkMode = useDarkMode();
+  const editorPreviousValueRef = useRef<string | undefined>(value);
+  const editorCurrentValueRef = useCurrentValueRef<string | undefined>(value);
+
+  const optionDefinition = OPTION_DEFINITION[name];
+  const isDocumentEditor = optionDefinition.type === 'document';
+
+  placeholder ??= optionDefinition.placeholder;
+  value ??= '';
+
+  const onValueChange = useCallback(
+    (newVal: string) => {
+      return onChange(name, newVal);
+    },
+    [name, onChange]
+  );
+
+  const onUnsafeInteger = useCallback(() => {
+    return onUnsafeIntegerReceived(name);
+  }, [name, onUnsafeIntegerReceived]);
+
+  const onBlurEditor = useCallback(() => {
+    if (
+      !!editorCurrentValueRef.current &&
+      editorCurrentValueRef.current !== editorPreviousValueRef.current &&
+      (editorPreviousValueRef.current || editorCurrentValueRef.current !== '{}')
+    ) {
+      track('Query Edited', { option_name: name }, connectionInfoRef.current);
+      editorPreviousValueRef.current = editorCurrentValueRef.current;
+    }
+  }, [editorCurrentValueRef, track, name, connectionInfoRef]);
+
+  // MaxTimeMS warning tooltip logic
+  const maxTimeMSEnvLimit = usePreference('maxTimeMSEnvLimit');
+  const numericValue = useMemo(() => {
+    if (!value) return 0;
+    const parsed = Number(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }, [value]);
+
+  const exceedsMaxTimeMSLimit = useMemo(() => {
+    return (
+      name === 'maxTimeMS' &&
+      maxTimeMSEnvLimit && // 0 is falsy, so no limit when 0
+      numericValue >= maxTimeMSEnvLimit
+    );
+  }, [name, maxTimeMSEnvLimit, numericValue]);
+
+  return (
+    <div
+      className={cx(
+        queryOptionStyles,
+        isDocumentEditor && documentEditorOptionContainerStyles
+      )}
+      data-testid={`query-bar-option-${name}`}
+    >
+      {/* The filter label is shown by the query bar. */}
+      {name !== 'filter' && (
+        <div
+          className={
+            isDocumentEditor
+              ? documentEditorLabelContainerStyles
+              : queryOptionLabelContainerStyles
+          }
+        >
+          <Label
+            htmlFor={id}
+            id={`query-bar-option-input-${name}-label`}
+            disabled={disabled}
+            className={
+              isDocumentEditor
+                ? documentEditorQueryOptionLabelStyles
+                : queryOptionLabelStyles
+            }
+          >
+            {optionDefinition.label ?? name}
+          </Label>
+        </div>
+      )}
+      <div className={cx(isDocumentEditor && documentEditorOptionStyles)}>
+        {isDocumentEditor ? (
+          <OptionEditor
+            optionName={name as QueryOptionOfTypeDocument}
+            hasError={hasError}
+            id={id}
+            onChange={onValueChange}
+            onBlur={onBlurEditor}
+            placeholder={placeholder}
+            value={value}
+            data-testid={`query-bar-option-${name}-input`}
+            onApply={onApply}
+            disabled={disabled}
+            onUnsafeInteger={onUnsafeInteger}
+          />
+        ) : (
+          <WithOptionDefinitionTextInputProps definition={optionDefinition}>
+            {({ props }) => {
+              const textInput = (
+                <TextInput
+                  aria-labelledby={`query-bar-option-input-${name}-label`}
+                  id={id}
+                  data-testid={`query-bar-option-${name}-input`}
+                  className={cx(
+                    darkMode
+                      ? numericTextInputDarkStyles
+                      : numericTextInputLightStyles,
+                    hasError && optionInputWithErrorStyles
+                  )}
+                  type="text"
+                  sizeVariant="small"
+                  state={hasError ? 'error' : 'none'}
+                  value={value}
+                  onChange={(evt: React.ChangeEvent<HTMLInputElement>) =>
+                    onValueChange(evt.currentTarget.value)
+                  }
+                  onBlur={onBlurEditor}
+                  placeholder={placeholder as string}
+                  disabled={disabled}
+                  {...props}
+                />
+              );
+
+              // Wrap maxTimeMS field with tooltip in web environment when exceeding limit
+              if (exceedsMaxTimeMSLimit) {
+                return (
+                  <Tooltip
+                    enabled={true}
+                    open={true}
+                    trigger={({
+                      children,
+                      ...triggerProps
+                    }: React.HTMLProps<HTMLDivElement>) => (
+                      <div {...triggerProps}>
+                        {textInput}
+                        {children}
+                      </div>
+                    )}
+                  >
+                    Operations longer than 5 minutes are not supported in the
+                    web environment
+                  </Tooltip>
+                );
+              }
+
+              return textInput;
+            }}
+          </WithOptionDefinitionTextInputProps>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const ConnectedQueryOption = connect(
+  (state: RootState, ownProps: { name: QueryProperty }) => {
+    const field = state.queryBar.fields[ownProps.name];
+    return {
+      value: field.string,
+      hasError: !field.valid,
+    };
+  },
+  { onChange: changeField, onUnsafeIntegerReceived: unsafeIntegerReceived }
+)(QueryOption);
+
+export default ConnectedQueryOption;
